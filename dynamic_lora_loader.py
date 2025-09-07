@@ -1,11 +1,14 @@
 import os
+import re
+import random
 from functools import reduce
 from operator import mul
 import folder_paths
 from nodes import LoraLoader, CLIPTextEncode
 
 class DynamicLoraLoader:
-    """Takes MODEL, pos/neg prompts, optional CLIP, dynamic list of configs.
+    """Takes MODEL, pos/neg prompts, optional CLIP, dynamic list of configs and embeddings.
+    Supports randomizer codes like {tall:short:skinny:fat} and config combinations.
     Outputs modified (MODEL, CLIP, pos_prompt_out, neg_prompt_out)."""
 
     @classmethod
@@ -23,6 +26,14 @@ class DynamicLoraLoader:
         for i in range(1, 11):  # Start with 10 potential config slots
             optional[f"config_{i}"] = ("DYNAMIC_LORA_CONFIG",)
         
+        # Create multiple positive embedding inputs
+        for i in range(1, 6):
+            optional[f"pos_embedding_{i}"] = ("DYNAMIC_LORA_EMBEDDING",)
+            
+        # Create multiple negative embedding inputs
+        for i in range(1, 6):
+            optional[f"neg_embedding_{i}"] = ("DYNAMIC_LORA_EMBEDDING",)
+        
         return {"required": required, "optional": optional}
 
     RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING",)
@@ -36,7 +47,119 @@ class DynamicLoraLoader:
         try: return max(float(mn), min(float(mx), float(val)))
         except: return val
 
+    def _process_randomizer_codes(self, text):
+        """Process {option1:option2:option3} randomizer codes in text."""
+        if not text:
+            return text
+            
+        def replace_randomizer(match):
+            options = match.group(1).split(':')
+            # Filter out empty options
+            options = [opt.strip() for opt in options if opt.strip()]
+            return random.choice(options) if options else ""
+        
+        # Find and replace all {option1:option2:...} patterns
+        pattern = r'\{([^}]+)\}'
+        result = re.sub(pattern, replace_randomizer, text)
+        return result
+
+    def _collect_embeddings(self, kwargs, prefix):
+        """Collect embedding inputs with given prefix."""
+        embeddings = []
+        for key, value in kwargs.items():
+            if key.startswith(prefix) and value is not None:
+                if isinstance(value, dict):
+                    embeddings.append(value)
+                elif isinstance(value, list):
+                    embeddings.extend([e for e in value if isinstance(e, dict)])
+        return embeddings
+
+    def _apply_embeddings(self, prompt, embeddings):
+        """Apply embeddings to prompt."""
+        if not embeddings or not prompt:
+            return prompt
+            
+        embedding_tags = []
+        for emb in embeddings:
+            name = emb.get("embedding_name", "")
+            weight = emb.get("weight", 1.0)
+            
+            if name:
+                if weight == 1.0:
+                    tag = name
+                else:
+                    tag = f"({name}:{weight})"
+                embedding_tags.append(tag)
+        
+        # Add embedding tags to beginning of prompt
+        if embedding_tags:
+            return " ".join(embedding_tags) + " " + prompt
+        return prompt
+
+    def _resolve_config_combinations(self, cfgs, configs_to_apply):
+        """Handle config combinations - when one config in a group is activated, activate all."""
+        if not configs_to_apply:
+            return configs_to_apply
+            
+        # Group configs by combo group
+        combo_groups = {}
+        standalone_configs = []
+        
+        for config in cfgs:
+            group_id = config.get("_combo_group")
+            if group_id:
+                if group_id not in combo_groups:
+                    combo_groups[group_id] = []
+                combo_groups[group_id].append(config)
+            else:
+                standalone_configs.append(config)
+        
+        # Check which combo groups have at least one activated config
+        activated_groups = set()
+        applied_ids = {c.get("id") for c in configs_to_apply}
+        
+        for group_id, group_configs in combo_groups.items():
+            group_ids = {c.get("id") for c in group_configs}
+            if group_ids.intersection(applied_ids):
+                activated_groups.add(group_id)
+        
+        # Build final list of configs to apply
+        final_configs = []
+        
+        # Add standalone configs that were already selected
+        for config in standalone_configs:
+            if config in configs_to_apply:
+                final_configs.append(config)
+        
+        # Add all configs from activated combo groups
+        for group_id in activated_groups:
+            for config in combo_groups[group_id]:
+                # Calculate final strength for combo configs that weren't originally selected
+                if config not in configs_to_apply:
+                    # Use base strength since no keyword matching occurred
+                    base_strength = float(config.get("base_strength", 1.0))
+                    final_strength = self._clamp(base_strength, 
+                                               config.get("min_strength", -2.0), 
+                                               config.get("max_strength", 2.0))
+                    config["final_strength"] = final_strength
+                
+                final_configs.append(config)
+        
+        return final_configs
+
     def build_model_clip_and_prompts(self, model, pos_prompt, neg_prompt, clip=None, **kwargs):
+        # Process randomizer codes first
+        pos_prompt = self._process_randomizer_codes(pos_prompt or "")
+        neg_prompt = self._process_randomizer_codes(neg_prompt or "")
+        
+        # Collect embedding inputs
+        pos_embeddings = self._collect_embeddings(kwargs, "pos_embedding_")
+        neg_embeddings = self._collect_embeddings(kwargs, "neg_embedding_")
+        
+        # Apply embeddings to prompts
+        pos_prompt = self._apply_embeddings(pos_prompt, pos_embeddings)
+        neg_prompt = self._apply_embeddings(neg_prompt, neg_embeddings)
+        
         # Collect all config inputs from numbered parameters
         cfgs = []
         for key, value in kwargs.items():
@@ -57,10 +180,10 @@ class DynamicLoraLoader:
                     tags.append(t)
 
         # Add missing activation tags to positive prompt
-        pos_lower = (pos_prompt or "").lower()
+        pos_lower = pos_prompt.lower()
         missing = [t for t in tags if t.lower() not in pos_lower]
-        pos_out = (" ".join(missing) + " " + (pos_prompt or "")).strip() if missing else (pos_prompt or "")
-        neg_out = neg_prompt or ""
+        pos_out = (" ".join(missing) + " " + pos_prompt).strip() if missing else pos_prompt
+        neg_out = neg_prompt
 
         # Calculate final strengths and filter configs that should be applied
         id_map = {c.get("id"): c for c in cfgs if c.get("id")}
@@ -72,7 +195,7 @@ class DynamicLoraLoader:
             
             # Skip LoRAs that have no keywords defined - we only load LoRAs with matching keywords
             if not keywords_groups:
-                final_strength = self._clamp(final_strength, c.get("min_strength", -2.0), c.get("max_strength", 2.0))
+                final_strength = self._clamp(base_strength, c.get("min_strength", -2.0), c.get("max_strength", 2.0))
                 c["final_strength"] = final_strength
                 configs_to_apply.append(c)
                 continue
@@ -109,6 +232,9 @@ class DynamicLoraLoader:
             final_strength = self._clamp(final_strength, c.get("min_strength", -2.0), c.get("max_strength", 2.0))
             c["final_strength"] = final_strength
             configs_to_apply.append(c)
+
+        # Resolve config combinations
+        configs_to_apply = self._resolve_config_combinations(cfgs, configs_to_apply)
 
         # Generate LoRA tags for prompt (only for configs that will be applied)
         lora_tags = []
@@ -147,7 +273,7 @@ class DynamicLoraLoader:
                 print(f"[DynamicLoraLoader] CLIPTextEncode failed: {e}")
                 clip = None
 
-        # Apply LoRA models to the model and clip (only for configs that matched keywords)
+        # Apply LoRA models to the model and clip (only for configs that matched keywords or were combo-activated)
         for c in configs_to_apply:
             lora_filename = c.get("path") or c.get("id")
             if not lora_filename: 
@@ -165,7 +291,8 @@ class DynamicLoraLoader:
                                              strength_clip=c["final_strength"])
                 if isinstance(out, (tuple,list)) and len(out)>=2:
                     model, clip = out[0], out[1]
-                    print(f"[DynamicLoraLoader] Applied LoRA {c.get('id')} with strength {c['final_strength']}")
+                    combo_info = f" (combo: {c.get('_combo_group', 'none')})" if c.get("_combo_group") else ""
+                    print(f"[DynamicLoraLoader] Applied LoRA {c.get('id')} with strength {c['final_strength']}{combo_info}")
             except Exception as e:
                 print(f"[DynamicLoraLoader] Failed to apply LoRA {c.get('id')}: {e}")
 
