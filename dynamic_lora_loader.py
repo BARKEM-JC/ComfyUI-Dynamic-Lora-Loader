@@ -101,6 +101,8 @@ class DynamicLoraLoader:
         if not configs_to_apply:
             return configs_to_apply
             
+        print(f"[DynamicLoraLoader] Resolving combinations. Original configs to apply: {len(configs_to_apply)}")
+        
         # Group configs by combo group
         combo_groups = {}
         standalone_configs = []
@@ -111,8 +113,11 @@ class DynamicLoraLoader:
                 if group_id not in combo_groups:
                     combo_groups[group_id] = []
                 combo_groups[group_id].append(config)
+                print(f"[DynamicLoraLoader] Config {config.get('id')} belongs to combo group {group_id}")
             else:
                 standalone_configs.append(config)
+        
+        print(f"[DynamicLoraLoader] Found {len(combo_groups)} combo groups and {len(standalone_configs)} standalone configs")
         
         # Check which combo groups have at least one activated config
         activated_groups = set()
@@ -122,6 +127,7 @@ class DynamicLoraLoader:
             group_ids = {c.get("id") for c in group_configs}
             if group_ids.intersection(applied_ids):
                 activated_groups.add(group_id)
+                print(f"[DynamicLoraLoader] Activating combo group {group_id} due to matching config(s)")
         
         # Build final list of configs to apply
         final_configs = []
@@ -136,15 +142,28 @@ class DynamicLoraLoader:
             for config in combo_groups[group_id]:
                 # Calculate final strength for combo configs that weren't originally selected
                 if config not in configs_to_apply:
+                    print(f"[DynamicLoraLoader] Adding combo config {config.get('id')} that wasn't originally selected")
                     # Use base strength since no keyword matching occurred
                     base_strength = float(config.get("base_strength", 1.0))
-                    final_strength = self._clamp(base_strength, 
+                    
+                    # Apply offset multipliers from other configs
+                    id_map = {c.get("id"): c for c in cfgs if c.get("id")}
+                    final_strength = base_strength
+                    for other_id, off_mult in (config.get("offsets") or {}).items():
+                        if other_id in id_map and other_id != config.get("id"):
+                            try: 
+                                final_strength *= float(off_mult)
+                            except: 
+                                pass
+                    
+                    final_strength = self._clamp(final_strength, 
                                                config.get("min_strength", -2.0), 
                                                config.get("max_strength", 2.0))
                     config["final_strength"] = final_strength
                 
                 final_configs.append(config)
         
+        print(f"[DynamicLoraLoader] Final configs to apply: {len(final_configs)}")
         return final_configs
 
     def build_model_clip_and_prompts(self, model, pos_prompt, neg_prompt, clip=None, **kwargs):

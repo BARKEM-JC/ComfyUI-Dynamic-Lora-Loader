@@ -17,9 +17,8 @@ class DynamicLoraConfigCombiner:
         
         return {"required": required, "optional": optional}
     
-    RETURN_TYPES = ("DYNAMIC_LORA_CONFIG",)
-    RETURN_NAMES = ("combined_configs",)
-    OUTPUT_IS_LIST = (True,)  # Output list of configs
+    RETURN_TYPES = tuple(["DYNAMIC_LORA_CONFIG"] * 10)  # Return up to 10 configs
+    RETURN_NAMES = tuple([f"config_{i}" for i in range(1, 11)])
     FUNCTION = "combine_configs"
     CATEGORY = "conditioning"
     
@@ -36,7 +35,8 @@ class DynamicLoraConfigCombiner:
                     configs.extend([c for c in value if isinstance(c, dict)])
         
         if not configs:
-            return ([],)
+            # Return None for all outputs
+            return tuple([None] * 10)
         
         # Add linking metadata to each config
         group_id = f"combined_{id(self)}"  # Unique group identifier
@@ -53,4 +53,8 @@ class DynamicLoraConfigCombiner:
             
             configs[i] = linked_config
         
-        return (configs,)
+        # Pad with None values to match return count
+        while len(configs) < 10:
+            configs.append(None)
+        
+        return tuple(configs[:10])
